@@ -1,0 +1,755 @@
+-- COMPLETE SPECTATOR SYSTEM QUALITY OVERHAUL
+-- Location: StarterPlayer > StarterPlayerScripts > SpectatorSystem (LocalScript)
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
+local TweenService = game:GetService("TweenService")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera = Workspace.CurrentCamera
+
+-- ============================================================================
+-- SETTINGS CONFIGURATION
+-- ============================================================================
+local Settings = {
+    cameraMode = "ThirdPerson",
+    zoomDistance = 8,
+    cameraHeight = 2,
+    cameraOffset = 0,
+    faceLock = true,
+    positionSmoothness = 0.15,
+    rotationSmoothness = 0.15,
+    trackingResponsiveness = 0.1,
+    minZoom = 2,
+    maxZoom = 20,
+    defaultZoom = 8,
+    zoomSensitivity = 1,
+    fov = 70,
+    motionBlurEnabled = false,
+    blurIntensity = 0.5,
+    blurResponsiveness = 0.2,
+}
+
+function Settings.Set(key, value)
+    if Settings[key] ~= nil then
+        Settings[key] = value
+    end
+end
+
+-- ============================================================================
+-- SPECTATOR STATE
+-- ============================================================================
+local State = {
+    active = false,
+    targetPlayer = nil,
+    targetChar = nil,
+    targetRoot = nil,
+    targetHead = nil,
+    lastCameraType = nil,
+    lastCameraSubject = nil,
+    connections = {},
+    targetConn = nil,
+    cameraConn = nil,
+    blurConn = nil,
+    blurEffect = nil,
+    lastCameraCFrame = nil,
+    accumulatedBlur = 0,
+    -- For smooth transitions
+    transitionAlpha = 0,
+    transitionSpeed = 5,
+    targetCFrame = nil,
+    lastCFrame = nil,
+}
+
+local function disconnectAll()
+    for _, conn in ipairs(State.connections) do
+        if typeof(conn) == "RBXScriptConnection" then
+            conn:Disconnect()
+        end
+    end
+    table.clear(State.connections)
+    
+    if State.targetConn then
+        State.targetConn:Disconnect()
+        State.targetConn = nil
+    end
+end
+
+local function addConnection(conn)
+    table.insert(State.connections, conn)
+end
+
+local function getValidPlayers()
+    local valid = {}
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Character and plr.Character:FindFirstChild("Humanoid") and plr.Character.Humanoid.Health > 0 then
+            table.insert(valid, plr)
+        end
+    end
+    return valid
+end
+
+-- ============================================================================
+-- CAMERA MATH & LOGIC
+-- ============================================================================
+local function smoothLerp(current, target, dt, speed)
+    local alpha = 1 - math.exp(-speed * dt)
+    return current:Lerp(target, alpha)
+end
+
+local function calculateCameraPosition(mode, root, head, distance, height, offset)
+    local rootCFrame = root.CFrame
+    local headCFrame = head.CFrame
+    local lookVec = rootCFrame.LookVector
+    
+    if mode == "FirstPerson" then
+        return headCFrame * CFrame.new(0, 0.5, -0.5)
+    elseif mode == "ThirdPerson" then
+        return CFrame.lookAt(
+            rootCFrame.Position + Vector3.new(0, height, 0) - lookVec * distance,
+            rootCFrame.Position + Vector3.new(0, height, 0)
+        )
+    elseif mode == "FaceLock" then
+        return CFrame.lookAt(
+            headCFrame.Position + lookVec * distance,
+            headCFrame.Position
+        )
+    elseif mode == "Cinematic" then
+        local rightVec = rootCFrame.RightVector
+        return CFrame.lookAt(
+            rootCFrame.Position + lookVec * distance + rightVec * offset + Vector3.new(0, height, 0),
+            rootCFrame.Position + Vector3.new(0, height, 0)
+        )
+    end
+    return rootCFrame
+end
+
+local function updateCamera(dt)
+    if not State.targetChar or not State.targetRoot or not State.targetHead then return end
+    if not State.targetRoot.Parent or not State.targetHead.Parent then return end
+    
+    local humanoid = State.targetChar:FindFirstChildOfClass("Humanoid")
+    if not humanoid or humanoid.Health <= 0 then return end
+    
+    local mode = Settings.cameraMode
+    local distance = Settings.zoomDistance
+    local height = Settings.cameraHeight
+    local offset = Settings.cameraOffset
+    
+    local desiredCFrame = calculateCameraPosition(mode, State.targetRoot, State.targetHead, distance, height, offset)
+    
+    -- Collision prevention
+    if mode ~= "FirstPerson" then
+        local rayOrigin = State.targetHead.Position
+        local rayDir = desiredCFrame.Position - rayOrigin
+        local rayParams = RaycastParams.new()
+        rayParams.FilterDescendantsInstances = {State.targetChar, Camera}
+        rayParams.FilterType = Enum.RaycastFilterType.Exclude
+        
+        local result = Workspace:Raycast(rayOrigin, rayDir, rayParams)
+        if result then
+            local hitDistance = (result.Position - rayOrigin).Magnitude
+            local maxAllowed = math.max(0.5, hitDistance - 0.5)
+            local dir = rayDir.Unit
+            desiredCFrame = CFrame.lookAt(rayOrigin + dir * maxAllowed, rayOrigin)
+        end
+    end
+    
+    -- Smoothing with frame-independent interpolation
+    local posSpeed = Settings.positionSmoothness * 10
+    local rotSpeed = Settings.rotationSmoothness * 10
+    
+    local currentPos = Camera.CFrame.Position
+    local currentRot = Camera.CFrame.Rotation
+    
+    local newPos = smoothLerp(currentPos, desiredCFrame.Position, dt, posSpeed)
+    local newRot = currentRot:Lerp(desiredCFrame.Rotation, 1 - math.exp(-rotSpeed * dt))
+    
+    Camera.CFrame = CFrame.new(newPos) * newRot
+    Camera.FieldOfView = Camera.FieldOfView + (Settings.fov - Camera.FieldOfView) * (1 - math.exp(-5 * dt))
+end
+
+-- ============================================================================
+-- MOTION BLUR
+-- ============================================================================
+local function createBlur()
+    if State.blurEffect then return end
+    State.blurEffect = Instance.new("BlurEffect")
+    State.blurEffect.Name = "SpectatorMotionBlur"
+    State.blurEffect.Size = 0
+    State.blurEffect.Parent = Lighting
+end
+
+local function destroyBlur()
+    if State.blurEffect then
+        State.blurEffect:Destroy()
+        State.blurEffect = nil
+    end
+end
+
+local function updateBlur(dt)
+    if not Settings.motionBlurEnabled or not State.blurEffect then
+        if State.blurEffect then State.blurEffect.Size = 0 end
+        return
+    end
+    
+    local currentCFrame = Camera.CFrame
+    
+    if State.lastCameraCFrame then
+        local look1 = State.lastCameraCFrame.LookVector
+        local look2 = currentCFrame.LookVector
+        local dot = look1:Dot(look2)
+        local angle = math.acos(math.clamp(dot, -1, 1))
+        
+        local intensity = Settings.blurIntensity * 10
+        local maxBlur = 15
+        local targetBlur = math.min(angle * intensity / math.max(dt, 0.001) * Settings.blurResponsiveness, maxBlur)
+        
+        State.accumulatedBlur = State.accumulatedBlur + (targetBlur - State.accumulatedBlur) * (1 - math.exp(-10 * dt))
+        State.blurEffect.Size = math.max(0, State.accumulatedBlur)
+    end
+    
+    State.lastCameraCFrame = currentCFrame
+end
+
+local function enableBlur()
+    createBlur()
+    if State.blurConn then State.blurConn:Disconnect() end
+    State.blurConn = RunService.RenderStepped:Connect(updateBlur)
+end
+
+local function disableBlur()
+    if State.blurConn then
+        State.blurConn:Disconnect()
+        State.blurConn = nil
+    end
+    destroyBlur()
+    State.accumulatedBlur = 0
+    State.lastCameraCFrame = nil
+end
+
+-- ============================================================================
+-- UI CREATION
+-- ============================================================================
+local gui = Instance.new("ScreenGui")
+gui.Name = "SpectatorUI"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 100
+gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+local mainFrame = Instance.new("Frame")
+mainFrame.Size = UDim2.new(0, 280, 0, 400)
+mainFrame.Position = UDim2.new(1, -20, 0.5, -200)
+mainFrame.AnchorPoint = Vector2.new(1, 0)
+mainFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+mainFrame.BackgroundTransparency = 0.1
+mainFrame.BorderSizePixel = 0
+mainFrame.Visible = true
+mainFrame.Parent = gui
+
+local mainCorner = Instance.new("UICorner")
+mainCorner.CornerRadius = UDim.new(0, 8)
+mainCorner.Parent = mainFrame
+
+local mainStroke = Instance.new("UIStroke")
+mainStroke.Color = Color3.fromRGB(80, 50, 150)
+mainStroke.Thickness = 1
+mainStroke.Parent = mainFrame
+
+-- Header
+local header = Instance.new("Frame")
+header.Size = UDim2.new(1, 0, 0, 40)
+header.BackgroundTransparency = 1
+header.Parent = mainFrame
+
+local title = Instance.new("TextLabel")
+title.Text = "SPECTATOR SYSTEM"
+title.Size = UDim2.new(1, -20, 1, 0)
+title.Position = UDim2.new(0, 10, 0, 0)
+title.BackgroundTransparency = 1
+title.TextColor3 = Color3.fromRGB(180, 140, 255)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 16
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = header
+
+-- Target Display
+local targetFrame = Instance.new("Frame")
+targetFrame.Size = UDim2.new(1, -20, 0, 30)
+targetFrame.Position = UDim2.new(0, 10, 0, 40)
+targetFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+targetFrame.Parent = mainFrame
+
+local targetCorner = Instance.new("UICorner")
+targetCorner.CornerRadius = UDim.new(0, 4)
+targetCorner.Parent = targetFrame
+
+local targetNameLabel = Instance.new("TextLabel")
+targetNameLabel.Text = "None"
+targetNameLabel.Size = UDim2.new(1, 0, 1, 0)
+targetNameLabel.BackgroundTransparency = 1
+targetNameLabel.TextColor3 = Color3.fromRGB(220, 220, 220)
+targetNameLabel.Font = Enum.Font.GothamMedium
+targetNameLabel.TextSize = 14
+targetNameLabel.Parent = targetFrame
+
+-- Scrolling Frame for Controls
+local scroll = Instance.new("ScrollingFrame")
+scroll.Size = UDim2.new(1, -20, 1, -120)
+scroll.Position = UDim2.new(0, 10, 0, 80)
+scroll.BackgroundTransparency = 1
+scroll.ScrollBarThickness = 4
+scroll.ScrollBarImageColor3 = Color3.fromRGB(100, 50, 200)
+scroll.Parent = mainFrame
+
+local scrollLayout = Instance.new("UIListLayout")
+scrollLayout.Padding = UDim.new(0, 10)
+scrollLayout.SortOrder = Enum.SortOrder.LayoutOrder
+scrollLayout.Parent = scroll
+
+-- UI Helper Functions
+local function createToggle(parent, text, initialState, callback)
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(1, 0, 0, 30)
+    frame.BackgroundTransparency = 1
+    
+    local label = Instance.new("TextLabel")
+    label.Text = text
+    label.Size = UDim2.new(0.7, 0, 1, 0)
+    label.BackgroundTransparency = 1
+    label.TextColor3 = Color3.fromRGB(220, 220, 220)
+    label.Font = Enum.Font.GothamMedium
+    label.TextSize = 14
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = frame
+    
+    local toggleBtn = Instance.new("TextButton")
+    toggleBtn.Size = UDim2.new(0.2, 0, 0, 24)
+    toggleBtn.Position = UDim2.new(0.75, 0, 0.5, -12)
+    toggleBtn.BackgroundColor3 = initialState and Color3.fromRGB(100, 50, 200) or Color3.fromRGB(60, 60, 60)
+    toggleBtn.Text = initialState and "ON" or "OFF"
+    toggleBtn.TextColor3 = Color3.new(1, 1, 1)
+    toggleBtn.Font = Enum.Font.GothamBold
+    toggleBtn.TextSize = 12
+    toggleBtn.Parent = frame
+    
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(1, 0)
+    corner.Parent = toggleBtn
+    
+    local toggled = initialState
+    toggleBtn.MouseButton1Click:Connect(function()
+        toggled = not toggled
+        toggleBtn.BackgroundColor3 = toggled and Color3.fromRGB(100, 50, 200) or Color3.fromRGB(60, 60, 60)
+        toggleBtn.Text = toggled and "ON" or "OFF"
+        if callback then callback(toggled) end
+    end)
+    
+    frame.Parent = parent
+    return frame
+end
+
+local function createSlider(parent, text, min, max, initial, callback)
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(1, 0, 0, 44)
+    frame.BackgroundTransparency = 1
+    
+    local label = Instance.new("TextLabel")
+    label.Text = text
+    label.Size = UDim2.new(1, 0, 0, 18)
+    label.BackgroundTransparency = 1
+    label.TextColor3 = Color3.fromRGB(220, 220, 220)
+    label.Font = Enum.Font.GothamMedium
+    label.TextSize = 14
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = frame
+    
+    local track = Instance.new("Frame")
+    track.Size = UDim2.new(1, 0, 0, 6)
+    track.Position = UDim2.new(0, 0, 1, -6)
+    track.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+    track.Parent = frame
+    
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(1, 0)
+    corner.Parent = track
+    
+    local fill = Instance.new("Frame")
+    fill.Size = UDim2.new((initial - min) / (max - min), 0, 1, 0)
+    fill.BackgroundColor3 = Color3.fromRGB(100, 50, 200)
+    fill.Parent = track
+    
+    local fillCorner = Instance.new("UICorner")
+    fillCorner.CornerRadius = UDim.new(1, 0)
+    fillCorner.Parent = fill
+    
+    local knob = Instance.new("Frame")
+    knob.Size = UDim2.new(0, 14, 0, 14)
+    knob.Position = UDim2.new((initial - min) / (max - min), -7, 0.5, -7)
+    knob.BackgroundColor3 = Color3.new(1, 1, 1)
+    knob.Parent = track
+    
+    local knobCorner = Instance.new("UICorner")
+    knobCorner.CornerRadius = UDim.new(1, 0)
+    knobCorner.Parent = knob
+    
+    local dragging = false
+    
+    local function updateFromMouse(mouseX)
+        local relX = math.clamp((mouseX - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+        local value = min + (max - min) * relX
+        fill.Size = UDim2.new(relX, 0, 1, 0)
+        knob.Position = UDim2.new(relX, -7, 0.5, -7)
+        if callback then callback(value) end
+    end
+    
+    track.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            updateFromMouse(input.Position.X)
+        end
+    end)
+    
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            updateFromMouse(input.Position.X)
+        end
+    end)
+    
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+    
+    frame.Parent = parent
+    return frame
+end
+
+-- Controls
+createToggle(scroll, "Face Lock", Settings.faceLock, function(val)
+    Settings.Set("faceLock", val)
+end)
+
+createSlider(scroll, "Position Smoothness", 0.01, 1, Settings.positionSmoothness, function(val)
+    Settings.Set("positionSmoothness", val)
+end)
+
+createSlider(scroll, "Rotation Smoothness", 0.01, 1, Settings.rotationSmoothness, function(val)
+    Settings.Set("rotationSmoothness", val)
+end)
+
+-- Camera Mode Buttons
+local modeFrame = Instance.new("Frame")
+modeFrame.Size = UDim2.new(1, 0, 0, 60)
+modeFrame.BackgroundTransparency = 1
+modeFrame.Parent = scroll
+
+local modes = {"FirstPerson", "ThirdPerson", "FaceLock", "Cinematic"}
+for i, mode in ipairs(modes) do
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0.5, -2, 0.5, -2)
+    btn.Position = UDim2.new((i-1) % 2 * 0.5, 0, math.floor((i-1) / 2) * 0.5, 0)
+    btn.BackgroundColor3 = (Settings.cameraMode == mode) and Color3.fromRGB(100, 50, 200) or Color3.fromRGB(40, 40, 50)
+    btn.Text = mode
+    btn.TextColor3 = Color3.fromRGB(220, 220, 220)
+    btn.Font = Enum.Font.GothamMedium
+    btn.TextSize = 12
+    btn.Parent = modeFrame
+    
+    local btnCorner = Instance.new("UICorner")
+    btnCorner.CornerRadius = UDim.new(0, 4)
+    btnCorner.Parent = btn
+    
+    btn.MouseButton1Click:Connect(function()
+        Settings.Set("cameraMode", mode)
+        for _, child in ipairs(modeFrame:GetChildren()) do
+            if child:IsA("TextButton") then
+                child.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+            end
+        end
+        btn.BackgroundColor3 = Color3.fromRGB(100, 50, 200)
+    end)
+end
+
+createSlider(scroll, "Zoom Distance", Settings.minZoom, Settings.maxZoom, Settings.zoomDistance, function(val)
+    Settings.Set("zoomDistance", val)
+end)
+
+createSlider(scroll, "FOV", 40, 120, Settings.fov, function(val)
+    Settings.Set("fov", val)
+end)
+
+createToggle(scroll, "Motion Blur", Settings.motionBlurEnabled, function(val)
+    Settings.Set("motionBlurEnabled", val)
+end)
+
+-- Footer / Toggle Button
+local footer = Instance.new("Frame")
+footer.Size = UDim2.new(1, 0, 0, 40)
+footer.Position = UDim2.new(0, 0, 1, -40)
+footer.BackgroundTransparency = 1
+footer.Parent = mainFrame
+
+local toggleMainBtn = Instance.new("TextButton")
+toggleMainBtn.Size = UDim2.new(1, -20, 0, 30)
+toggleMainBtn.Position = UDim2.new(0, 10, 0, 5)
+toggleMainBtn.BackgroundColor3 = Color3.fromRGB(100, 50, 200)
+toggleMainBtn.Text = "ENABLE SPECTATOR"
+toggleMainBtn.TextColor3 = Color3.new(1, 1, 1)
+toggleMainBtn.Font = Enum.Font.GothamBold
+toggleMainBtn.TextSize = 14
+toggleMainBtn.Parent = footer
+
+local toggleCorner = Instance.new("UICorner")
+toggleCorner.CornerRadius = UDim.new(0, 4)
+toggleCorner.Parent = toggleMainBtn
+
+-- ============================================================================
+-- PLAYER LIST PANEL (WITH REFRESH BUTTON)
+-- ============================================================================
+local playerListContainer = Instance.new("Frame")
+playerListContainer.Size = UDim2.new(0, 150, 0, 340)
+playerListContainer.Position = UDim2.new(0, 20, 0.5, -170)
+playerListContainer.BackgroundTransparency = 1
+playerListContainer.Visible = true
+playerListContainer.Parent = gui
+
+local refreshBtn = Instance.new("TextButton")
+refreshBtn.Size = UDim2.new(1, 0, 0, 30)
+refreshBtn.Position = UDim2.new(0, 0, 0, 0)
+refreshBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+refreshBtn.Text = "REFRESH PLAYERS"
+refreshBtn.TextColor3 = Color3.fromRGB(220, 220, 220)
+refreshBtn.Font = Enum.Font.GothamBold
+refreshBtn.TextSize = 12
+refreshBtn.Parent = playerListContainer
+
+local refreshCorner = Instance.new("UICorner")
+refreshCorner.CornerRadius = UDim.new(0, 4)
+refreshCorner.Parent = refreshBtn
+
+local playerListFrame = Instance.new("ScrollingFrame")
+playerListFrame.Size = UDim2.new(1, 0, 1, -36)
+playerListFrame.Position = UDim2.new(0, 0, 0, 36)
+playerListFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+playerListFrame.BackgroundTransparency = 0.1
+playerListFrame.BorderSizePixel = 0
+playerListFrame.ScrollBarThickness = 4
+playerListFrame.Parent = playerListContainer
+
+local listCorner = Instance.new("UICorner")
+listCorner.CornerRadius = UDim.new(0, 8)
+listCorner.Parent = playerListFrame
+
+local listLayout = Instance.new("UIListLayout")
+listLayout.Padding = UDim.new(0, 4)
+listLayout.Parent = playerListFrame
+
+-- ============================================================================
+-- SPECTATOR CONTROL LOGIC
+-- ============================================================================
+local setTarget
+
+local function refreshPlayerList()
+    for _, child in ipairs(playerListFrame:GetChildren()) do
+        if child:IsA("TextButton") then child:Destroy() end
+    end
+    
+    for _, plr in ipairs(getValidPlayers()) do
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(1, -8, 0, 30)
+        btn.BackgroundColor3 = (State.targetPlayer == plr) and Color3.fromRGB(100, 50, 200) or Color3.fromRGB(40, 40, 50)
+        btn.Text = plr.DisplayName
+        btn.TextColor3 = Color3.fromRGB(220, 220, 220)
+        btn.Font = Enum.Font.GothamMedium
+        btn.TextSize = 12
+        btn.Parent = playerListFrame
+        
+        local btnCorner = Instance.new("UICorner")
+        btnCorner.CornerRadius = UDim.new(0, 4)
+        btnCorner.Parent = btn
+        
+        btn.MouseButton1Click:Connect(function()
+            if State.active then
+                setTarget(plr)
+                -- Highlight selected player
+                for _, child in ipairs(playerListFrame:GetChildren()) do
+                    if child:IsA("TextButton") then
+                        child.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+                    end
+                end
+                btn.BackgroundColor3 = Color3.fromRGB(100, 50, 200)
+            end
+        end)
+    end
+end
+
+setTarget = function(plr)
+    if not State.active then return end
+    if not plr or plr == LocalPlayer then return end
+    if not plr.Character then return end
+    
+    local humanoid = plr.Character:FindFirstChildOfClass("Humanoid")
+    if not humanoid or humanoid.Health <= 0 then return end
+    
+    -- Disconnect previous target's CharacterAdded
+    if State.targetConn then
+        State.targetConn:Disconnect()
+        State.targetConn = nil
+    end
+    
+    State.targetPlayer = plr
+    State.targetChar = plr.Character
+    State.targetRoot = plr.Character:FindFirstChild("HumanoidRootPart")
+    State.targetHead = plr.Character:FindFirstChild("Head")
+    
+    targetNameLabel.Text = plr.DisplayName
+    
+    -- Listen for respawns of this specific target
+    State.targetConn = plr.CharacterAdded:Connect(function(newChar)
+        if State.active and State.targetPlayer == plr then
+            State.targetChar = newChar
+            State.targetRoot = newChar:FindFirstChild("HumanoidRootPart")
+            State.targetHead = newChar:FindFirstChild("Head")
+        end
+    end)
+end
+
+local function stopSpectating()
+    if not State.active then return end
+    State.active = false
+    
+    disconnectAll()
+    if State.cameraConn then
+        RunService:UnbindFromRenderStep("SpectatorCamera")
+        State.cameraConn = nil
+    end
+    disableBlur()
+    
+    mainFrame.Visible = true
+    playerListContainer.Visible = true
+    toggleMainBtn.Text = "ENABLE SPECTATOR"
+    
+    -- Restore camera
+    if Camera.CameraType == Enum.CameraType.Scriptable then
+        Camera.CameraType = State.lastCameraType or Enum.CameraType.Custom
+        if State.lastCameraSubject then
+            Camera.CameraSubject = State.lastCameraSubject
+        elseif LocalPlayer.Character then
+            local hum = LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+            if hum then Camera.CameraSubject = hum end
+        end
+    end
+    
+    State.targetPlayer = nil
+    State.targetChar = nil
+    State.targetRoot = nil
+    State.targetHead = nil
+    targetNameLabel.Text = "None"
+end
+
+local function startSpectating()
+    if State.active then return end
+    State.active = true
+    State.lastCameraType = Camera.CameraType
+    State.lastCameraSubject = Camera.CameraSubject
+    
+    Camera.CameraType = Enum.CameraType.Scriptable
+    
+    -- Clean up any existing camera binding
+    RunService:UnbindFromRenderStep("SpectatorCamera")
+    State.cameraConn = RunService:BindToRenderStep(
+        "SpectatorCamera",
+        Enum.RenderPriority.Camera.Value + 1,
+        function(dt)
+            updateCamera(dt)
+        end
+    )
+    
+    enableBlur()
+    mainFrame.Visible = true
+    playerListContainer.Visible = true
+    toggleMainBtn.Text = "DISABLE SPECTATOR"
+    
+    refreshPlayerList()
+    
+    -- Do NOT auto-select. Leave target null until user clicks a player.
+    State.targetPlayer = nil
+    State.targetChar = nil
+    State.targetRoot = nil
+    State.targetHead = nil
+    targetNameLabel.Text = "Select a player..."
+    
+    -- Input handling
+    addConnection(UserInputService.InputBegan:Connect(function(input, gpe)
+        if gpe or not State.active then return end
+        
+        if input.KeyCode == Enum.KeyCode.LeftBracket then
+            local players = getValidPlayers()
+            if #players > 0 then
+                local idx = table.find(players, State.targetPlayer) or 1
+                idx = idx - 1
+                if idx < 1 then idx = #players end
+                setTarget(players[idx])
+                refreshPlayerList()
+            end
+        elseif input.KeyCode == Enum.KeyCode.RightBracket then
+            local players = getValidPlayers()
+            if #players > 0 then
+                local idx = table.find(players, State.targetPlayer) or 0
+                idx = idx + 1
+                if idx > #players then idx = 1 end
+                setTarget(players[idx])
+                refreshPlayerList()
+            end
+        elseif input.KeyCode == Enum.KeyCode.P then
+            stopSpectating()
+        end
+    end))
+    
+    -- Handle players leaving
+    addConnection(Players.PlayerRemoving:Connect(function(plr)
+        if State.active and State.targetPlayer == plr then
+            local valid = getValidPlayers()
+            if #valid > 0 then
+                setTarget(valid[1])
+            else
+                stopSpectating()
+            end
+        end
+        refreshPlayerList()
+    end))
+    
+    -- Handle players joining
+    addConnection(Players.PlayerAdded:Connect(function(plr)
+        refreshPlayerList()
+    end))
+end
+
+toggleMainBtn.MouseButton1Click:Connect(function()
+    if State.active then
+        stopSpectating()
+    else
+        startSpectating()
+    end
+end)
+
+refreshBtn.MouseButton1Click:Connect(function()
+    refreshPlayerList()
+end)
+
+-- Initialize player list on load
+refreshPlayerList()
+
+-- Cleanup
+script.Destroying:Connect(function()
+    stopSpectating()
+    gui:Destroy()
+end)
+
+print("[SpectatorSystem] Loaded. Select a player from the list to begin.")
